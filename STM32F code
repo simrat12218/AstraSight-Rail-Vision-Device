@@ -1,0 +1,456 @@
+#include <STM32FreeRTOS.h>
+#include <Wire.h>
+#include <TFMPI2C.h>
+#include <MCUFRIEND_kbv.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// === Color definitions ===
+#define RED      0xF800
+#define GREEN    0x07E0
+#define YELLOW   0xFFE0
+#define WHITE    0xFFFF
+#define BLACK    0x0000
+#define DARKGRAY 0x7BEF // A color for 'off' LEDs
+
+// === Receiver LED pins (Matches traffic light colors) ===
+#define RX_LED_RED     PC10 // Red LED on the receiver
+#define RX_LED_YELLOW  PC11 // Yellow LED on the receiver
+#define RX_LED_GREEN   PC12 // Green LED on the receiver
+
+// === LoRa pins ===
+#define LORA_CS    PB12
+#define LORA_RST  PB14
+#define LORA_DIO0 PB13
+#define LORA_FREQUENCY 433E6 // 433 MHz
+
+// === Traffic Signal States ===
+// Using simple states: 0=RED, 1=YELLOW, 2=GREEN
+#define STATE_RED      0
+#define STATE_YELLOW   1
+#define STATE_GREEN    2
+
+// === Timing Constants ===
+// Timeout after receiving a command to revert to RED
+#define STATE_TIMEOUT_MS 10000 // 10 seconds (slightly more than transmitter's 10s)
+
+// === Threshold Distance ===
+#define DISTANCE_THRESHOLD 20 // Changed from 10cm to 20cm
+
+// === Shared Variables ===
+volatile int16_t sharedDistance = -1;
+volatile int trafficSignalState = STATE_RED; // Initial state is RED
+SemaphoreHandle_t distanceMutex;
+SemaphoreHandle_t ledMutex; // Protects trafficSignalState and related variables
+QueueHandle_t stateQueue; // Queue receives target state from LoRa task
+
+// Variables for timeout logic
+volatile uint32_t lastStateChangeTime = 0; // Tick count when state last changed from RED
+
+// === Objects ===
+TFMPI2C tfmP;
+MCUFRIEND_kbv tft;
+
+// === Display Layout Settings ===
+struct DisplayLayout {
+    uint8_t textSizeMain = 3;     // Main text size
+    uint8_t textSizeSmall = 2;    // Small text size
+
+    uint16_t distanceLabelX = 20;  // "Distance:" text position
+    uint16_t distanceLabelY = 20;
+
+    uint16_t distanceValueX = 200; // Distance number position
+    uint16_t distanceValueY = 20;
+
+    uint16_t distanceUnitX = 260;  // "cm" text position
+    uint16_t distanceUnitY = 20;
+
+    uint16_t messageX = 20;        // Obstacle message position
+    uint16_t messageY = 85;
+
+    // Signal Status Title Position
+    uint16_t signalStatusTitleX = 20;
+    uint16_t signalStatusTitleY = 60; // Adjusted Y
+
+    // Traffic Signal Drawing (New Graphic)
+    uint16_t signalBoxX = 380;     // Top-left X of the signal box
+    uint16_t signalBoxY = 80;      // Top-left Y of the signal box
+    uint16_t signalBoxWidth = 60;
+    uint16_t signalBoxHeight = 180;
+    uint16_t signalCornerRadius = 10; // Rounded corners
+
+    uint16_t ledRadius = 20;       // Radius of the LED circles
+    uint16_t ledSpacing = 15;      // Vertical space between circles
+
+    // Y positions for LEDs within the signal box
+    uint16_t redLedY;
+    uint16_t yellowLedY; // Only one yellow circle
+    uint16_t greenLedY;
+    uint16_t ledCenterX; // X position for all LEDs
+
+    // Calculated during setup
+    void calculatePositions() {
+        ledCenterX = signalBoxX + signalBoxWidth / 2;
+        // Calculate to center the block of 3 items (R, Y, G) inside the box
+        uint16_t usableHeight = signalBoxHeight - 2 * signalCornerRadius;
+        uint16_t totalLedHeight = 3 * 2 * ledRadius + 2 * ledSpacing; // Height of 3 circles and 2 spaces
+        uint16_t startY = signalBoxY + signalCornerRadius + (usableHeight - totalLedHeight)/2;
+
+        redLedY = startY + ledRadius;
+        yellowLedY = redLedY + ledRadius*2 + ledSpacing;
+        greenLedY = yellowLedY + ledRadius*2 + ledSpacing;
+    }
+};
+
+DisplayLayout layout;
+
+// === Sensor Task ===
+void sensorTask(void *pvParameters) {
+    (void) pvParameters;
+    int16_t tfDist = 0;
+
+    for (;;) {
+        tfmP.getData(tfDist);
+
+        if (tfmP.status == TFMP_READY) {
+            if (xSemaphoreTake(distanceMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                sharedDistance = tfDist;
+                xSemaphoreGive(distanceMutex);
+            }
+        } else {
+            if (xSemaphoreTake(distanceMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                sharedDistance = -1; // Indicate sensor error or no data
+                xSemaphoreGive(distanceMutex);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// === Traffic Signal Drawing Helper ===
+void drawTrafficSignal(int state) {
+    // Draw the LED circles based on the state
+    // Clear previous LED states by drawing black circles first
+    tft.fillCircle(layout.ledCenterX, layout.redLedY, layout.ledRadius, BLACK);
+    tft.fillCircle(layout.ledCenterX, layout.yellowLedY, layout.ledRadius, BLACK); // Only one yellow circle
+    tft.fillCircle(layout.ledCenterX, layout.greenLedY, layout.ledRadius, BLACK);
+
+    // Draw outlines
+    tft.drawCircle(layout.ledCenterX, layout.redLedY, layout.ledRadius, DARKGRAY);
+    tft.drawCircle(layout.ledCenterX, layout.yellowLedY, layout.ledRadius, DARKGRAY);
+    tft.drawCircle(layout.ledCenterX, layout.greenLedY, layout.ledRadius, DARKGRAY);
+
+    // Fill the active LEDs
+    switch (state) {
+        case STATE_RED:
+            tft.fillCircle(layout.ledCenterX, layout.redLedY, layout.ledRadius, RED);
+            break;
+        case STATE_YELLOW:
+            tft.fillCircle(layout.ledCenterX, layout.yellowLedY, layout.ledRadius, YELLOW);
+            break;
+        case STATE_GREEN:
+            tft.fillCircle(layout.ledCenterX, layout.greenLedY, layout.ledRadius, GREEN);
+            break;
+        default:
+            // All off state, perhaps? Or default to RED?
+            tft.fillCircle(layout.ledCenterX, layout.redLedY, layout.ledRadius, RED);
+            break;
+    }
+}
+
+// === Display Task ===
+void tftDisplayTask(void *pvParameters) {
+    (void) pvParameters;
+    int16_t localDistance = -1, lastDisplayedDistance = -2;
+    bool obstacleDetectedState = false, lastObstacleDetectedState = false;
+    int lastTrafficSignalState = -1; // Track last state drawn
+
+    uint16_t ID = tft.readID();
+    Serial.print("TFT Read ID: 0x");
+    Serial.println(ID, HEX);
+    tft.begin(ID == 0x9486 ? ID : 0x9486); // Force ID if necessary
+
+    tft.setRotation(1); // Landscape mode
+    tft.fillScreen(BLACK);
+
+    // --- Static Labels ---
+    tft.setTextSize(layout.textSizeMain);
+    tft.setTextColor(WHITE, BLACK);
+
+    tft.setCursor(layout.distanceLabelX, layout.distanceLabelY);
+    tft.print("Distance:");
+
+    tft.setCursor(layout.distanceUnitX, layout.distanceUnitY);
+    tft.print("cm");
+
+    // --- Draw "Signal Status" Title ---
+    tft.setCursor(layout.signalStatusTitleX, layout.signalStatusTitleY);
+    tft.print("Signal Status");
+
+    // --- Draw Static Traffic Signal Box ---
+    layout.calculatePositions(); // Calculate LED positions based on box
+    tft.fillRoundRect(layout.signalBoxX, layout.signalBoxY, layout.signalBoxWidth, layout.signalBoxHeight, layout.signalCornerRadius, DARKGRAY);
+
+    // Draw initial LED outlines (fill happens dynamically)
+    // Use DARKGRAY outline for clarity when the LED is off
+    tft.drawCircle(layout.ledCenterX, layout.redLedY, layout.ledRadius, DARKGRAY);
+    tft.drawCircle(layout.ledCenterX, layout.yellowLedY, layout.ledRadius, DARKGRAY);
+    tft.drawCircle(layout.ledCenterX, layout.greenLedY, layout.ledRadius, DARKGRAY);
+
+    for (;;) {
+        // --- Read Shared Variables ---
+        if (xSemaphoreTake(distanceMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            localDistance = sharedDistance;
+            xSemaphoreGive(distanceMutex);
+        }
+
+        int localTrafficSignalState = -1;
+        if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            localTrafficSignalState = trafficSignalState;
+            xSemaphoreGive(ledMutex);
+        }
+
+        // --- Update Distance ---
+        // Only display distance if it's below threshold or if there's a sensor error
+        bool shouldDisplayDistance = (localDistance >= 0 && localDistance <= DISTANCE_THRESHOLD);
+        if ((shouldDisplayDistance && localDistance != lastDisplayedDistance) || 
+            (!shouldDisplayDistance && lastDisplayedDistance != -2)) {
+            // Clear old number
+            tft.fillRect(layout.distanceValueX, layout.distanceValueY, 60, layout.textSizeMain * 8 * 1.2, BLACK); // Estimate text block height
+            tft.setCursor(layout.distanceValueX, layout.distanceValueY);
+            tft.setTextSize(layout.textSizeMain); // Ensure correct size
+            tft.setTextColor(WHITE, BLACK); // Ensure correct color
+            if (shouldDisplayDistance) {
+                tft.print(localDistance);
+                lastDisplayedDistance = localDistance;
+            } else {
+                tft.print("---"); // Hide distance if above threshold or sensor error
+                lastDisplayedDistance = -2; // Unique value to indicate hidden state
+            }
+        }
+
+        // --- Update Obstacle Message ---
+        obstacleDetectedState = (localDistance >= 0 && localDistance < DISTANCE_THRESHOLD);
+
+        // Always update the message to ensure "Track Clear" is visible when no obstacle is detected
+        tft.fillRect(layout.messageX, layout.messageY, 300, layout.textSizeMain * 8 * 1.2, BLACK); // Clear old message area
+        tft.setCursor(layout.messageX, layout.messageY);
+        tft.setTextSize(layout.textSizeMain); // Ensure correct size
+
+        if (obstacleDetectedState) {
+            tft.setTextColor(RED, BLACK);
+            tft.print("Obstacle Detected ");
+        } else { // localDistance >= DISTANCE_THRESHOLD or localDistance == -1 (sensor error)
+            tft.setTextColor(GREEN, BLACK);
+            tft.print("Track Clear       "); // Always show "Track Clear" when no obstacle
+        }
+        tft.setTextColor(WHITE, BLACK); // Revert to white for other text
+        lastObstacleDetectedState = obstacleDetectedState;
+
+        // --- Update Traffic Signal Display ---
+        if (localTrafficSignalState != lastTrafficSignalState) {
+            drawTrafficSignal(localTrafficSignalState);
+            lastTrafficSignalState = localTrafficSignalState;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50)); // Display update rate
+    }
+}
+
+// === LoRa Receive Task ===
+void TaskLoRaReceive(void *pvParameters) {
+    (void) pvParameters;
+    for (;;) {
+        int packetSize = LoRa.parsePacket();
+        if (packetSize) {
+            String received = "";
+            while (LoRa.available()) {
+                received += (char)LoRa.read();
+            }
+            Serial.print("Received LoRa message: ");
+            Serial.println(received);
+
+            int targetState = -1; // Use -1 to indicate no valid command received
+            // Map received strings to our target states
+            if (received.equalsIgnoreCase("LED2")) { // Transmitter's Yellow LED command
+                targetState = STATE_YELLOW;
+            } else if (received.equalsIgnoreCase("LED3")) { // Transmitter's Green LED command
+                targetState = STATE_GREEN;
+            } else if (received.equalsIgnoreCase("LED1") || received.equalsIgnoreCase("RED")) { // Transmitter's Red LED (default) - handle if it's ever sent
+                targetState = STATE_RED;
+            }
+
+            if (targetState != -1) {
+                // Send the target state to the LED handling task
+                xQueueSend(stateQueue, &targetState, pdMS_TO_TICKS(10));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5)); // Check for packets frequently
+    }
+}
+
+// === LED Control Task (Manages state machine and physical LEDs) ===
+void TaskHandleLED(void *pvParameters) {
+    (void) pvParameters;
+    int receivedTargetState;
+    int currentState; // Keep a local copy of the current state for logic
+
+    // --- Initial State Setup ---
+    if (xSemaphoreTake(ledMutex, portMAX_DELAY) == pdTRUE) {
+        trafficSignalState = STATE_RED; // Ensure global state matches setup
+        lastStateChangeTime = 0; // No active timer on initial RED
+        xSemaphoreGive(ledMutex);
+    }
+    // Control physical LEDs for initial RED state
+    digitalWrite(RX_LED_RED, HIGH);
+    digitalWrite(RX_LED_YELLOW, LOW);
+    digitalWrite(RX_LED_GREEN, LOW);
+    Serial.println("LED Task initialized to RED state.");
+
+    for (;;) {
+        // --- Check for new commands from LoRa Task ---
+        if (xQueueReceive(stateQueue, &receivedTargetState, pdMS_TO_TICKS(10)) == pdTRUE) {
+            Serial.print("LED Task received target state: ");
+            Serial.println(receivedTargetState);
+
+            // Acquire mutex before changing shared state and physical LEDs
+            if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                // Only change state if the received state is different
+                if (receivedTargetState != trafficSignalState) {
+                    trafficSignalState = receivedTargetState; // Update the state
+
+                    // Control physical LEDs based on the NEW state
+                    digitalWrite(RX_LED_RED, LOW);
+                    digitalWrite(RX_LED_YELLOW, LOW);
+                    digitalWrite(RX_LED_GREEN, LOW); // Turn all off first
+
+                    switch (trafficSignalState) {
+                        case STATE_RED:
+                            digitalWrite(RX_LED_RED, HIGH);
+                            lastStateChangeTime = 0; // Reset timer when going to RED
+                            Serial.println("Switched LED state to RED (by command).");
+                            break;
+                        case STATE_YELLOW:
+                            digitalWrite(RX_LED_YELLOW, HIGH);
+                            lastStateChangeTime = xTaskGetTickCount(); // Start timer for timeout
+                            Serial.println("Switched LED state to YELLOW (by command).");
+                            break;
+                        case STATE_GREEN:
+                            digitalWrite(RX_LED_GREEN, HIGH);
+                            lastStateChangeTime = xTaskGetTickCount(); // Start timer for timeout
+                            Serial.println("Switched LED state to GREEN (by command).");
+                            break;
+                        default:
+                            // Handle unexpected state, maybe default to RED?
+                            digitalWrite(RX_LED_RED, HIGH);
+                            trafficSignalState = STATE_RED;
+                            lastStateChangeTime = 0;
+                            Serial.println("Received unknown state, switched to RED.");
+                            break;
+                    }
+                }
+                xSemaphoreGive(ledMutex); // Release mutex
+            }
+        }
+
+        // --- Check for Timeout if not in RED state ---
+        if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            currentState = trafficSignalState; // Get current state to check timeout
+            xSemaphoreGive(ledMutex); // Release mutex quickly
+
+            // Only check timeout if we are in YELLOW or GREEN
+            if ((currentState == STATE_YELLOW || currentState == STATE_GREEN) && lastStateChangeTime != 0) {
+                uint32_t elapsedTicks = xTaskGetTickCount() - lastStateChangeTime;
+                if (elapsedTicks >= pdMS_TO_TICKS(STATE_TIMEOUT_MS)) {
+                    Serial.println("Timeout: Reverting to RED state.");
+                    // Acquire mutex to change state and physical LEDs
+                    if (xSemaphoreTake(ledMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        trafficSignalState = STATE_RED; // Change state
+                        lastStateChangeTime = 0; // Reset timer
+
+                        // Control physical LEDs for RED state
+                        digitalWrite(RX_LED_RED, HIGH);
+                        digitalWrite(RX_LED_YELLOW, LOW);
+                        digitalWrite(RX_LED_GREEN, LOW);
+                        xSemaphoreGive(ledMutex); // Release mutex
+                    }
+                }
+            }
+        }
+
+        // Add a small delay so the task doesn't hog the CPU
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// === Setup ===
+void setup() {
+    Serial.begin(115200);
+    while (!Serial);
+    Serial.println("Receiver System Booting...");
+
+    // Initialize I2C for LiDAR
+    Wire.setSCL(PB8);
+    Wire.setSDA(PB9);
+    Wire.begin();
+    delay(100);
+
+    Serial.println("Initializing LiDAR...");
+    tfmP.recoverI2CBus();
+    if (tfmP.sendCommand(SOFT_RESET, 0)) Serial.println("LiDAR SOFT_RESET successful.");
+    else Serial.println("LiDAR SOFT_RESET failed!");
+
+    if (tfmP.sendCommand(SET_FRAME_RATE, FRAME_20)) Serial.println("LiDAR Frame Rate set to 20Hz.");
+    else Serial.println("LiDAR Frame Rate set failed!");
+    delay(100);
+
+    // Setup Receiver LED GPIOs
+    pinMode(RX_LED_RED, OUTPUT);
+    pinMode(RX_LED_YELLOW, OUTPUT);
+    pinMode(RX_LED_GREEN, OUTPUT);
+
+    // Set initial physical LED state to RED
+    digitalWrite(RX_LED_RED, HIGH); // Red on
+    digitalWrite(RX_LED_YELLOW, LOW); // Yellow off
+    digitalWrite(RX_LED_GREEN, LOW); // Green off
+    Serial.println("Physical LEDs initialized (RED).");
+
+    // Initialize Ravi
+    SPI.begin();
+    LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+    if (!LoRa.begin(LORA_FREQUENCY)) {
+        Serial.println("Starting LoRa failed!");
+        while (1); // Halt on LoRa failure
+    }
+    Serial.println("LoRa initialized.");
+
+    // Initialize shared variables state
+    // trafficSignalState initialized globally to STATE_RED
+    // lastStateChangeTime initialized globally to 0
+
+    // Create RTOS primitives
+    distanceMutex = xSemaphoreCreateMutex();
+    ledMutex = xSemaphoreCreateMutex();
+    // Queue size increased slightly as states might be sent quickly
+    stateQueue = xQueueCreate(10, sizeof(int)); // Queue for target states
+
+    if (!distanceMutex || !ledMutex || !stateQueue) {
+        Serial.println("Failed to create RTOS primitives!");
+        while (1); // Halt on RTOS primitive creation failure
+    }
+
+    // Create FreeRTOS tasks
+    xTaskCreate(sensorTask, "Sensor", 256, NULL, 2, NULL);
+    xTaskCreate(tftDisplayTask, "Display", 1024, NULL, 1, NULL); // Increased stack for graphics
+    xTaskCreate(TaskLoRaReceive, "LoRaRx", 256, NULL, 2, NULL);
+    xTaskCreate(TaskHandleLED, "LED", 256, NULL, 3, NULL); // Higher priority for quick state updates
+
+    Serial.println("All tasks created. Starting scheduler...");
+    vTaskStartScheduler();
+}
+
+// === Main loop ===
+void loop() {
+    // Nothing here - FreeRTOS tasks handle everything
+}
