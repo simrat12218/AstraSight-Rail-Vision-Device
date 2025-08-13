@@ -1,0 +1,176 @@
+#include <STM32FreeRTOS.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// LoRa pin definitions
+#define LORA_CS   PB12
+#define LORA_RST  PB14
+#define LORA_DIO0 PB13
+#define LORA_FREQUENCY 433E6  // Corrected from 433E63
+
+// LED and button pin definitions
+#define LED1 PC10
+#define LED2 PC11
+#define LED3 PC12
+#define BUTTON_PIN PC13
+
+// FreeRTOS handles
+QueueHandle_t ledQueue;           // Queue for LED control
+QueueHandle_t ledTransmitQueue;  // Queue for LoRa transmission
+SemaphoreHandle_t buttonSemaphore;
+
+// Button handling variables
+unsigned long lastButtonPressTime = 0;
+int buttonPressCount = 0;
+bool buttonHandled = false;
+const unsigned long clickTimeout = 500;
+
+// LED timing
+unsigned long ledActiveStartTime = 0;
+bool ledTemporarilyActive = false;
+int activeTempLED = 0;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("LoRa Transmitter + External Button LED Control (FreeRTOS)");
+
+  // Setup GPIOs
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Setup LoRa
+  SPI.begin();
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQUENCY)) {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+  Serial.println("LoRa Initialized!");
+
+  // Create RTOS queues and semaphore
+  ledQueue = xQueueCreate(5, sizeof(int));
+  ledTransmitQueue = xQueueCreate(5, sizeof(int));
+  buttonSemaphore = xSemaphoreCreateBinary();
+
+  if (!ledQueue || !ledTransmitQueue || !buttonSemaphore) {
+    Serial.println("Failed to create FreeRTOS objects!");
+    while (1);
+  }
+
+  // Create FreeRTOS tasks
+  xTaskCreate(TaskButton, "ButtonTask", 128, NULL, 2, NULL);
+  xTaskCreate(TaskLoRaTransmit, "LoRaTransmitTask", 128, NULL, 1, NULL);
+  xTaskCreate(TaskHandleLED, "HandleLEDTask", 128, NULL, 1, NULL);
+
+  // Set default LED
+  activateOnlyLED(LED1);
+
+  // Start the FreeRTOS scheduler
+  vTaskStartScheduler();
+}
+
+void loop() {
+  // Not used, RTOS handles everything
+}
+
+// Button task
+void TaskButton(void *pvParameters) {
+  static bool lastButtonState = HIGH;
+
+  for (;;) {
+    bool currentButtonState = digitalRead(BUTTON_PIN);
+
+    if (lastButtonState == HIGH && currentButtonState == LOW) {
+      buttonPressCount++;
+      lastButtonPressTime = millis();
+      buttonHandled = false;
+      Serial.println("Button press detected");
+    }
+
+    lastButtonState = currentButtonState;
+
+    if ((millis() - lastButtonPressTime > clickTimeout) && (buttonPressCount > 0) && !buttonHandled) {
+      int ledPin = 0;
+      if (buttonPressCount == 1) {
+        Serial.println("Single Click: LED2 ON for 10s");
+        ledPin = LED2;
+      } else if (buttonPressCount == 2) {
+        Serial.println("Double Click: LED3 ON for 10s");
+        ledPin = LED3;
+      }
+
+      if (ledPin != 0) {
+        xQueueSend(ledQueue, &ledPin, portMAX_DELAY);
+        xQueueSend(ledTransmitQueue, &ledPin, portMAX_DELAY);
+        xSemaphoreGive(buttonSemaphore);
+      }
+
+      buttonPressCount = 0;
+      buttonHandled = true;
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);  // Poll every 10ms
+  }
+}
+
+// LoRa Transmit task
+void TaskLoRaTransmit(void *pvParameters) {
+  for (;;) {
+    if (xSemaphoreTake(buttonSemaphore, portMAX_DELAY) == pdTRUE) {
+      int ledPin;
+      if (xQueueReceive(ledTransmitQueue, &ledPin, 0) == pdTRUE) {
+        String message = (ledPin == LED2) ? "LED2" : "LED3";
+        LoRa.beginPacket();
+        LoRa.print(message);
+        LoRa.endPacket();
+        Serial.println("Transmitted via LoRa: " + message);
+      }
+    }
+  }
+}
+
+// LED Control task
+void TaskHandleLED(void *pvParameters) {
+  for (;;) {
+    int ledPin;
+    if (xQueueReceive(ledQueue, &ledPin, 0) == pdTRUE) {
+      Serial.print("Activating LED: ");
+      Serial.println(ledPin);
+      activateTemporaryLED(ledPin);
+    }
+
+    if (ledTemporarilyActive) {
+      if (millis() - ledActiveStartTime >= 10000) {
+        Serial.println("10 seconds passed. Restoring LED1.");
+        ledTemporarilyActive = false;
+        activateOnlyLED(LED1);
+      }
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // Check every 100ms
+  }
+}
+
+// Activate one LED for 10 seconds
+void activateTemporaryLED(int ledPin) {
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+  digitalWrite(ledPin, HIGH);
+
+  ledActiveStartTime = millis();
+  ledTemporarilyActive = true;
+  activeTempLED = ledPin;
+}
+
+// Activate only a specific LED (turn others off)
+void activateOnlyLED(int ledPin) {
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+  digitalWrite(ledPin, HIGH);
+}
