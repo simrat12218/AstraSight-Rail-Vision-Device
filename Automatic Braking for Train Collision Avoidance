@@ -1,0 +1,87 @@
+// ===== L298N Motor Driver Pins =====
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+#define ENA 5  // PWM Left motors
+#define ENB 6  // PWM Right motors
+
+// ===== Train speed control settings =====
+int maxSpeed = 200;     // PWM 0-255 (full speed)
+int minSpeed = 60;      // slowest speed before stop
+int stopThreshold = 20; // cm: train stops completely
+int slowThreshold = 50; // cm: begin slowing down
+
+// ===== Variables =====
+int distanceCM = 999; // default large distance
+String serialData = "";
+
+void setup() {
+  Serial.begin(115200); // read from STM32
+
+  // Set motor driver pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  stopTrain(); // ensure stopped at start
+}
+
+void loop() {
+  // Read serial from STM32
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      processDistance(serialData);
+      serialData = "";
+    } else {
+      serialData += c;
+    }
+  }
+
+  // Adjust speed based on distance
+  if (distanceCM <= stopThreshold) {
+    stopTrain();
+  } 
+  else if (distanceCM <= slowThreshold) {
+    // Smooth braking: map distance to PWM
+    int speed = map(distanceCM, stopThreshold, slowThreshold, minSpeed, maxSpeed);
+    setTrainSpeed(speed);
+  } 
+  else {
+    setTrainSpeed(maxSpeed);
+  }
+}
+
+// Process incoming distance string
+void processDistance(String data) {
+  data.trim();
+  if (data.startsWith("DIST:")) {
+    distanceCM = data.substring(5).toInt();
+  }
+}
+
+// Run train forward at given speed
+void setTrainSpeed(int speedVal) {
+  // Forward motion
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, speedVal);
+  analogWrite(ENB, speedVal);
+}
+
+// Stop train completely
+void stopTrain() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
