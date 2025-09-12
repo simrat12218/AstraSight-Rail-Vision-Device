@@ -1,5 +1,5 @@
-# AstraSight-Rail-Vision-Device
-# 🚆 AstraSight: Rail ki Nayi Disha
+# Agaah-Rail-Vision-Device
+# 🚆 Agaah: Rail ki Nayi Disha
 
 AstraSight is an advanced railway safety and situational awareness system designed to enhance train operations by detecting real-time obstacles, ensuring track clearance, and improving communication—all while significantly reducing infrastructure costs.
 
